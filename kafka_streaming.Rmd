@@ -1,0 +1,419 @@
+---
+title: "Kafka Streaming With R"
+author: "Jeremy Harris"
+date: "08/24/2020"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+##Setting Up The Environment
+
+###Zookeeper and Kafka are already working on cluster
+There's no need to install, config and start the zookeeper and kafka packages and servers. They are already running on the cluster. The commands you find to start them online won't work b/c the packages are installed in different loctaions in the examples. Good news is you can just get right down to business with using Kafka. 
+
+```{r, include = FALSE}
+library(dplyr, warn.conflicts = FALSE)
+library(sparklyr)
+library(lubridate)
+library(jsonlite)
+library(reticulate)
+
+##Set up your environment variables to use spark2
+
+############ new spark connection from Brad ############
+sc <- spark_connect(master = "yarn-client",
+                    version = "2.4.0",
+                    source ="/opt/cloudera/parcels/CDH-6.3.0-1.cdh6.3.0.p0.1279813/lib/spark/bin/spark-submit",
+                    packages ="kafka")
+
+
+###################
+```
+
+##CSV Data to Kafka
+To do this, we have to do the following:
+
+* First read in our cleaned data as a csv file.
+* We will then modify the data as needed to get a valuable output from our modeling function that have been saved as RDS objects. It must be value=<entire output> as Kafka will ONLY write out the contents of 'value'.
+* Then, we can write to a Kafka topic 
+* Once the streaming is setup, we can open a consumer window for the kafka topic.
+* With the consumer window open, we can input new files into the "csv_in" folder and watch the output appear in our kafka topic via the consumer window.
+
+###For newer models that aren't in the ml_pipeline stack, it's a little more complicated because you can't break the stream and then start it again - so you're left with only dplyr commonds to transform data. This can be an issue when working with matrix-based data.
+
+```{r}
+#read in our CSV file and get it to stream to Kafka
+
+#create folder for csv_in data 
+#system('hdfs dfs -mkdir temp/csv_in')
+
+
+#clean up folders for input/output
+system('hdfs dfs -rm -r temp/csv_in/*')
+
+#move file from my working directory to hdfs
+system(paste0('hdfs dfs -put -f ', getwd(),'/test1b.csv temp/csv_in/mcen_test1b.csv')) #has to be at least one file to get started or error
+
+system(paste0('hdfs dfs -put -f ', getwd(),'/test1b.csv temp/csv_in/mcen_test2b.csv'))
+system(paste0('hdfs dfs -put -f ', getwd(),'/test1b.csv temp/csv_in/mcen_test3b.csv'))
+system(paste0('hdfs dfs -put -f ', getwd(),'/test1b.csv temp/csv_in/mcen_test4b.csv'))
+system(paste0('hdfs dfs -put -f ', getwd(),'/test1b.csv temp/csv_in/mcen_test5b.csv'))
+
+```
+
+###Setup Streaming with MCEN Using Non-Standard Methods
+Details here: https://spark.rstudio.com/guides/pipelines/
+
+```{r}
+library(mcen)
+
+#read in RDS object for our model
+mod_in <- readRDS("mcen_COD.RDS")
+
+#create path to file
+csv_path <- file.path("hdfs://", "user/jh00003/temp/csv_in/*.csv")
+
+#create fresh topic for kafka output
+#system('kafka-topics --delete --zookeeper gbew3001:2181 --topic topic5') #delete topic1 to start fresh
+system('kafka-topics -create --zookeeper gbew3001:2181 --replication-factor 1 --partitions 1 --topic topic7') #create new topic7
+
+#set write options for kafka topoic
+write_options1 <- list(kafka.bootstrap.servers = "gbew3001:9092", topic = "topic7") 
+
+###Stream in csv data
+
+  #setup stream1 so to bring in new data for predictions
+  stream1 <- stream_read_csv(sc, path = csv_path)
+  
+  #get names of all variables
+  k1 <- collect(stream1) %>% select(1)
+
+  #bring in each of the 17 response columns beta values
+  m1=as.matrix(c(mod_in$beta[[10]][,1]))
+  m2=as.matrix(c(mod_in$beta[[10]][,2]))
+  m3=as.matrix(c(mod_in$beta[[10]][,3]))
+  m4=as.matrix(c(mod_in$beta[[10]][,4]))
+  m5=as.matrix(c(mod_in$beta[[10]][,5]))
+  m6=as.matrix(c(mod_in$beta[[10]][,6]))
+  m7=as.matrix(c(mod_in$beta[[10]][,7]))
+  m8=as.matrix(c(mod_in$beta[[10]][,8]))
+  m9=as.matrix(c(mod_in$beta[[10]][,9]))
+  m10=as.matrix(c(mod_in$beta[[10]][,10]))
+  m11=as.matrix(c(mod_in$beta[[10]][,11]))
+  m12=as.matrix(c(mod_in$beta[[10]][,12]))
+  m13=as.matrix(c(mod_in$beta[[10]][,13]))
+  m14=as.matrix(c(mod_in$beta[[10]][,14]))
+  m15=as.matrix(c(mod_in$beta[[10]][,15]))
+  m16=as.matrix(c(mod_in$beta[[10]][,16]))
+  m17=as.matrix(c(mod_in$beta[[10]][,17]))
+
+  #create a dataframe with betas and names of predictors to do a left_join with later
+  mm1=data.frame("X_c0"=k1,coef1=m1) %>%
+    mutate(coef2=m2, coef3=m3, coef4=m4, coef5=m5, coef6=m6, coef7=m7, coef8=m8, coef9=m9, coef10=m10,
+           coef11=m11, coef12=m12, coef13=m13, coef14=m14, coef15=m15, coef16=m16, coef17=m17) %>%
+    copy_to(sc,.,overwrite = TRUE)
+  
+  #stream data in, join with name information from stream1, sum up value by column, save as value= , write to Kafka topoic
+  stream2 <- stream_read_csv(sc, path = csv_path) %>% 
+    rename(X_c0="_c0") %>%
+    left_join(.,mm1,by="X_c0") %>% #join betas with new data from csv_path in stream
+    mutate(p1_heroin=x*coef1, p2_cocain=x*coef2, p3_fentanyl=x*coef3, p4_fent_ana=x*coef4, p5_oxycodon=x*coef5, #create pred for each
+           p6_oxymorph=x*coef6, p7_ethanol=x*coef7, p8_hydrocodone=x*coef8, p9_benzodaizp=x*coef9,
+           p10_meth=x*coef10, p11_amphet=x*coef11, p12_tramad=x*coef12, p13_morphine=x*coef13,
+           p14_hydromorph=x*coef14,p15_other=x*coef15,p16_opiate=x*coef6, p17_anyOpiod=x*coef17) %>%
+    select(-c(1:19)) %>% #drop all coefficients now that predictions are in place, drop variable names & x (new data)
+    summarise_all(funs(sum)) %>% #sum all columns to get by response variable in log(odds)
+    mutate(value = (paste0("p1_heroin:",p1_heroin,",","p2_cocain:",p2_cocain,",","p3_fentanyl:",p3_fentanyl,",","p4_fent_ana:",p4_fent_ana,",",
+           "p5_oxycodon:",p5_oxycodon,",","p6_oxymorph:",p6_oxymorph,",","p7_ethanol:",",","p8_hydrocodone:",p8_hydrocodone,",",
+           "p9_benzodaizp:",p9_benzodaizp,",","p10_meth:",p10_meth,",","p11_amphet:",p11_amphet,",","p12_tramad:",p12_tramad,",",
+           "p13_morphine:",p13_morphine,",","p14_hydromorph:",p14_hydromorph,",","p15_other:",p15_other,",",
+           "p16_opiate:",p16_opiate,",","p17_anyOpiod:",p17_anyOpiod))) %>% #create value column with each drug & prediction inside
+    select(value) %>%
+
+  #stream out to kafka
+  stream_write_kafka(options = write_options1, mode = "update")
+```
+
+```{r}
+### for reference - needs to be run in terminal when stream is working
+
+#kafka-console-consumer --bootstrap-server gbew3001:9092 --topic topic5 --from-beginning
+```
+
+```{r}
+stream_stop(stream2) #stop our kafka stream to topic1
+```
+
+
+##Try glm Model Here
+This is an example of how a model will work that is already in the ml_pipeline stack.
+
+```{r}
+#Build a pipeline without using RDS model (bascially, recreate the glm model)
+
+#####################################################################################################################
+#####   This is creating the model pipeline and saving it. Once saved, it doesn't need to be run again ##############
+#####   https://therinspark.com/streaming.html#transformations                            ###########################
+  
+#Bring in data for the model
+# train_in <- read.csv("CTtrain_kafka.csv", row.names=1) %>%
+#   mutate(DeadatInjuryLoc = ifelse(DeadatInjuryLoc == "TRUE", 1, 0))
+# 
+# #Copy data to spark for model pipeline
+# CTdata2_spark <- copy_to(sc, train_in, overwrite = TRUE)
+# 
+# 
+# glm_mod <- ml_pipeline(sc) %>%
+#   ft_r_formula(Heroin~. -Heroin-Cocaine-Fentanyl-FentanylAnalogue-Oxycodone-Oxymorphone-Ethanol-Hydrocodone-Benzodiazepine-Methadone-Amphet-Tramad-Morphine_NotHeroin-OpiateNOS-AnyOpioid) %>%
+#   ml_generalized_linear_regression() %>%
+#   ml_fit(CTdata2_spark)
+
+# ml_save(glm_mod,"glm_mod", overwrite = TRUE)
+#####################################################################################################################
+
+#Create data for prediciton
+#single row for testing - 5 files total
+# for(i in 1:5) {
+#   glm_single_row <- read.csv2("CTdata2.csv", row.names = 1)
+#   glm_single_row <- glm_single_row[i,] %>%
+#     mutate(DeadatInjuryLoc = as.numeric(ifelse(DeadatInjuryLoc == "TRUE", 1, 0)))
+#   write.csv(glm_single_row, paste0("glm_single_row",i,".csv"))
+# }
+
+############## Predict on the saved model #################
+
+#create path to file
+csv_path_glm <- file.path("hdfs://", "user/jh00003/temp/csv_glm_in/*.csv")
+
+#create new topic start fresh
+system('kafka-topics -create --zookeeper gbew3001:2181 --replication-factor 1 --partitions 1 --topic glm_topic3')
+
+#drop csv file in the folder of csv_path
+
+system('hdfs dfs -rm temp/csv_glm_in/*') #empty out input folder
+
+system(paste0('hdfs dfs -put -f ', getwd(),'/glm_single_row1.csv temp/csv_glm_in/glm_single1.csv'))
+system(paste0('hdfs dfs -put -f ', getwd(),'/glm_single_row2.csv temp/csv_glm_in/glm_single2.csv'))
+system(paste0('hdfs dfs -put -f ', getwd(),'/glm_single_row3.csv temp/csv_glm_in/glm_single3.csv'))
+system(paste0('hdfs dfs -put -f ', getwd(),'/glm_single_row4.csv temp/csv_glm_in/glm_single4.csv'))
+system(paste0('hdfs dfs -put -f ', getwd(),'/glm_single_row5.csv temp/csv_glm_in/glm_single5.csv'))
+
+#set write options for kafka topoic
+write_options1 <- list(kafka.bootstrap.servers = "gbew3001:9092", topic = "glm_topic3")
+
+#load glm model we saved above
+glm_kafka <- ml_load(sc, "glm_mod")
+
+#predict on the new data from stream_glm1
+stream_glm <- stream_read_csv(sc, path = csv_path_glm) %>%
+  ml_transform(glm_kafka, .) %>%
+  mutate(value = paste0("heroin:",prediction)) %>%
+  stream_write_kafka(options = write_options1)
+
+```
+
+```{r}
+#stop glm stream
+stream_stop(stream_glm)
+```
+
+```{r}
+###End your Spark Session
+spark_disconnect(sc)
+```
+
+
+
+# ~ The End ~
+
+
+
+
+
+\newpage
+---
+
+##The rest are notes and examples:
+
+
+###Testing ML Pipeline
+Example from: https://spark.rstudio.com/guides/pipelines/
+
+```{r}
+#setup pipeline for modeling
+r_pipeline <- . %>% mutate(cyl = paste0("c", cyl)) %>% lm(am ~ cyl + mpg, data = .)
+r_pipeline
+
+#pass mtcards data tot he pipeline
+r_model <- r_pipeline(mtcars)
+r_model
+
+```
+
+
+```{r}
+#other useful code for streaming data
+  ###write out to another csv
+  #stream_write_csv("temp/csv_out/")
+  
+  ###write out to memory
+  #stream_write_memory(name = "test_out1") 
+
+#pull output over to local file system so I can view it
+#system(paste0('hdfs dfs -get temp/csv_out/test_out ', getwd()))
+  
+
+```
+
+
+##Test CSV Example
+From rstudio-sparklyr.netlify.app/guides/streaming/
+
+Couldn't get this to work b/c the stream_generate_test keeps creating a new folder locally called "source" which isn't what I want. I tried changing the path several times to get it to hdfs... temp/csv_in without any luck. 
+
+```{r}
+#library(future)
+# 
+# if(file.exists("source")) unlink("source", TRUE) #empty read folder
+# if(file.exists("temp/csv_out")) unlink("temp/csv_out", TRUE) #empty write folder
+# 
+# stream_generate_test(iterations = 1, path = (sc, "temp/csv_in/"))
+# read_folder <- stream_read_csv(sc, path = file_path)
+# write_output <- stream_write_csv(read_folder, "temp/csv_out/")
+# invisible(future(stream_generate_test(interval = 0.5, iteration = 20, path = file_path)))
+# stream_view(write_output)
+# 
+# 
+# 
+# file_path = file.path("hdfs://",getwd(), "temp/csv_in")
+# 
+# stream_generate_test(iterations = 1)
+# read_folder <- stream_read_csv(sc, path = file_path, columns = "value")
+# write_output <- stream_write_csv(read_folder, write_folder)
+# 
+# invisible(future(stream_generate_test(interval = 0.5)))
+# 
+# stream_view(write_output)
+# stream_stop(write_output)
+
+```
+
+
+##Other Useful Information for Streaming
+
+I'm using an r-bloggers page for help on this. The page is located here:
+https://www.r-bloggers.com/building-a-kafka-and-spark-streaming-pipeline-part-i/
+Another good reference: https://docs.cloudera.com/documentation/enterprise/6/6.3/topics/kafka_clients.html
+
+##Code And Tips
+This is some stuff that I found useful as well as some stuff that Rob did as examples on the environment.
+Rob's Github page on this: https://github.com/th3walkingdud3/Lunch/blob/master/Kafka_get_started.Rmd
+
+###List existing topics in kafka
+kafka-topics --list --zookeeper gbew3001:2181
+
+###this will give you a prompt ">" from which you can manually pass data into a kafka topic, in this case 'topic1'
+kafka-console-producer --broker-list gbew3001:9092,gbew3002:9092,gbew3003:9092 --topic topic1
+
+
+###this will retrieve all data in the listed topic, including things added after the command is run
+kafka-console-consumer --bootstrap-server gbew3001:9092 --topic glm_topic3 --from-beginning
+kafka-console-consumer --bootstrap-server gbew3001:9092 --topic topic7 --from-beginning
+
+###Create Kafka Topic
+kafka-topics -create --zookeeper gbew3001:2181 --replication-factor 1 --partitions 1 --topic topic1
+
+###Delete Kafka Topic
+kafka-topics --delete --zookeeper gbew3001:2181 --topic topic1
+
+###Connect to Spark
+We want to do this in Spark so that it will transfer over nicely to our project that has much more data. 
+
+##Kafka Streaming - Rob's Example
+
+##Setup Kafka read and write options
+
+```{r}
+#setup read in options with topic1 as read in location
+# read_options <- list(kafka.bootstrap.servers = "gbew3001:9092", subscribe = "topic1",value.deserializer="org.apache.kafka.common.serialization.StringDeserializer")
+# 
+# #setup write options with topic2 as output location
+# write_options <- list(kafka.bootstrap.servers = "gbew3001:9092", topic = "topic2")
+```
+
+##Kafka Stream
+
+```{r}
+# stream <- stream_read_kafka(sc, options = read_options) %>% 
+#   mutate_all(.funs = as.character) %>%
+#   #do work
+#   stream_write_memory(name = "new_sdf2")
+
+#from here, if you go to the terminal tab and run the producer, then add items, they will pass to kafka, then to the 'stream', then converted to charaters, then written to "new_sdf2" in spark. NOTE: to see the data in the spark table, you must refresh the browser then click on the table icon next to the sdf name in the connections tab.
+
+#Used to write back to kafka using the write_options above.
+#stream_write_kafka(options = write_options)
+```
+
+##JSON Stream In - Jeremy's Example
+
+```{r}
+#create folder for json_in data and json_out data that kafka will monitor for input and also use for output
+# system('hdfs dfs -mkdir temp/json_in')
+# system('hdfs dfs -mkdir temp/json_out')
+# 
+# #get json file and save it locally for the test -- HAS TO BE LOCAL ON HDFS, NOT PROFILE
+# url <- "http://api.open-notify.org/iss-now.json"
+# iss_in <- fromJSON(url, flatten = TRUE)
+# 
+# #create local json file
+# write_json(iss_in, "iss_in.json")
+# 
+# #move file from my working directory to hdfs
+# system(paste0('hdfs dfs -put -f ', getwd(),'/iss_in.json temp/json_in/iss_in.json'))
+# 
+# 
+# #create path to file (different options, not working....)
+# json_path <- file.path("temp/json_in/*") #this one works!!!!!
+# #gben3001.hpd.wvu.edu:8020 from command hdfs getconf -confKey fs.defaultFS
+```
+##Read in local json file and write to memory
+
+```{r}
+#stream <- stream_read_json(sc, path = json_path, options = read_options) %>%
+# stream <- stream_read_json(sc, path = json_path) %>%
+#   stream_write_memory(name = "iss_out2") #just want to write csv files to memory
+# stream_stop(stream)
+
+```
+
+##Setup Stream from JSON to Kafka
+
+```{r}
+# library(sparklyr.nested)
+# #setup read/write options
+# write_options1 <- list(kafka.bootstrap.servers = "gbew3001:9092", topic = "topic1") #convert json to kafka
+# 
+# #create path to file
+# json_path <- file.path("temp/json_out/") 
+# 
+# 
+# 
+# #############################################
+# ##  This section isn't working ##
+# # I'm trying to convert the entire stream to a single string and then lable it as "value"
+# # so that it can be written to kafka. Now, kafka doesn't like a string or list.
+# 
+# 
+# ###Stream in json data and write to kafka topic1
+# stream2 <- stream_read_json(sc, path = json_path) %>%
+# #  mutate(value = as.character(.)) %>%
+# 
+#   stream_write_kafka(options = write_options1)
+# 
+# stream_stop(stream2) 
+```
